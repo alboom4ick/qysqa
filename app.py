@@ -1,14 +1,14 @@
 from fastapi import FastAPI, File, UploadFile
+from flask import Flask, jsonify, request
+import openai
+import json
+from io import BytesIO
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.vectorstores import InMemoryVectorStore
-import openai
-import json
-from io import BytesIO
 from pathlib import Path
 from typing_extensions import TypedDict
-
 
 # ----------- JSON schema for guard‑railed output ----------------------------
 class SummaryJson(TypedDict):
@@ -17,50 +17,66 @@ class SummaryJson(TypedDict):
     description: str
     location: str
 
-
 # ----------- Helper function to get embeddings ----------------------------
 def get_embeddings(text: str, model="text-embedding-ada-002"):
     """
     Gets the embeddings for the provided text using OpenAI's embeddings API.
     """
     response = openai.embeddings.create(
-        model=model, input=[text]  # The input should be a list of texts
+        model=model,
+        input=[text]  # The input should be a list of texts
     )
-    embeddings = [embedding["embedding"] for embedding in response["data"]]
-    return np.array(embeddings)
+    embeddings = [embedding['embedding'] for embedding in response['data']]
+    return embeddings
 
+# ----------- Flask App with /run endpoint ---------------------------------
+app = Flask(__name__)
 
-# ----------- main callable --------------------------------------------------
+@app.route("/run", methods=["POST"])
+def run_agent():
+    """
+    Endpoint to generate mock quiz questions from the uploaded PDF file.
+    """
+    file = request.files['file']
+    pdf_file = BytesIO(file.read())
+    
+    try:
+        # Process the PDF and generate the summary JSON
+        result = pdf_to_summary_json(pdf_file)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 def pdf_to_summary_json(pdf_file: BytesIO, model_name: str = "gpt-4") -> SummaryJson:
     """
     Extracts text from `pdf_file`, processes it, and returns mock test questions in SummaryJson format.
     """
-    # 1) Load & chunk the PDF content using PyPDFLoader and RecursiveCharacterTextSplitter
+    # 1) Save the uploaded PDF to a temporary file
     pdf_path = Path("uploaded_pdf.pdf")
     with open(pdf_path, "wb") as f:
         f.write(pdf_file.read())
 
+    # 2) Load PDF content and split it into chunks
     pages = PyPDFLoader(str(pdf_path)).load()
-
-    # Use RecursiveCharacterTextSplitter to break the document into chunks
     chunks = RecursiveCharacterTextSplitter(
         chunk_size=1_000, chunk_overlap=150
     ).split_documents(pages)
 
-    # 2) Embed & store chunks in RAM
+    # 3) Embed & store chunks in RAM
     vectordb = InMemoryVectorStore(OpenAIEmbeddings())
     vectordb.add_documents(chunks)
 
-    # 3) Retrieve top‑k context based on a query
+    # 4) Retrieve top‑k context based on a query
     question = "Make a test for students based on the lecture material"
     docs = vectordb.similarity_search(question, k=6)
     context = "\n\n".join(d.page_content for d in docs)
 
-    # 4) Generate JSON with structured output using GPT
+    # 5) Generate JSON with structured output using GPT
     llm = ChatOpenAI(model_name=model_name, temperature=0)
-    structured_llm = llm.with_structured_output(SummaryJson)  # forces valid schema
+    structured_llm = llm.with_structured_output(SummaryJson)
 
-    prompt = f"""You are a mock quiz generator. Based on the provided lecture notes, create the following types of questions:
+    prompt = f"""
+    You are a mock quiz generator. Based on the provided lecture notes, create the following types of questions:
     - One answer with 4 options to pick.
     - Multiple choice with 5-6 options to pick.
     - Matching questions.
@@ -94,28 +110,11 @@ def pdf_to_summary_json(pdf_file: BytesIO, model_name: str = "gpt-4") -> Summary
         ]
       }}
     ]
-
-    Ensure that the quiz questions are based only on the provided lecture notes or the test will fail."""
-
+    """
     json_out = structured_llm.invoke(prompt)
 
     return json_out
 
-
-# ----------- FastAPI setup --------------------------------------------------
-app = FastAPI()
-
-
-@app.post("/generate-quiz/")
-async def generate_quiz(file: UploadFile = File(...)):
-    """
-    Endpoint to generate mock quiz questions from the uploaded PDF file.
-    """
-    # Read the PDF file content
-    pdf_file = await file.read()
-    try:
-        # Process the PDF and generate the summary JSON
-        result = pdf_to_summary_json(BytesIO(pdf_file))
-        return json.dumps(result, indent=2, ensure_ascii=False)
-    except Exception as e:
-        return {"error": str(e)}
+# ----------- Run the Flask App --------------------------------------------
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000)
